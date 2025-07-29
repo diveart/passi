@@ -19,7 +19,14 @@ NAME
     passi is a simple yet powerful and convenient password manager.
 
 COMPLETE MODERN PASSWORD MANAGEMENT LIFECYCLE
-Passi provides a full-featured password management workflow covering every aspect of modern credential handling. Generate secure passwords with passi genp, store them with structured metadata using passi add, and retrieve credentials instantly via passi show or passi clip, or browse interactively with passi i. For two-factor authentication, scan QR codes from authenticator setup screens with passi qr screenshot.png to extract TOTP secrets, then generate time-based one-time passwords on demand with passi totp. From initial password creation to daily authentication workflows, passi handles the complete security lifecycle without requiring multiple tools or complex integrations.
+Passi provides a full-featured password management workflow covering every aspect of modern
+credential handling. Generate secure passwords with passi genp, store them with structured
+metadata using passi add, and retrieve credentials instantly via passi show or passi clip,
+or browse interactively with passi i. For two-factor authentication, scan QR codes from
+authenticator setup screens with passi qr screenshot.png to extract TOTP secrets, then
+generate time-based one-time passwords on demand with passi totp. From initial password
+creation to daily authentication workflows, passi handles the complete security lifecycle
+without requiring multiple tools or complex integrations.
 
 SYNOPSIS
     passi [file <path>] <command> [args]
@@ -128,7 +135,9 @@ SEE ALSO:
     gpg(1), fzf(1), oathtool(1), zbarimg(1), recutils(7)
 
 COPYING
-This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation; either version 2 of the License, or (at your option) any later version.
+This program is free software; you can redistribute it and/or modify it under the terms
+of the GNU General Public License as published by the Free Software Foundation; either
+version 2 of the License, or (at your option) any later version.
 
 MAIN DIFFERENTIATION POINTS PASSI VS PASS
 - Single encrypted ASCII file, zero metadata leakage
@@ -247,20 +256,43 @@ Passi prioritizes:
 NOTABLE ADVANTAGES
 
 1. TYPO-PROOF SYMMETRIC ENCRYPTION
-Passi prevents accidental password changes by validating your master password against the existing password storage file before allowing any modifications. When you enter the password for encryption, passi first tests that this same password can successfully decrypt your existing data - eliminating the risk of typos creating an inaccessible password storage file.
+Passi prevents accidental password changes by validating your master password against
+the existing password storage file before allowing any modifications. When you enter
+the password for encryption, passi first tests that this same password can successfully
+decrypt your existing data - eliminating the risk of typos creating an inaccessible
+password storage file.
 So this is impossible with passi even though you use symmetric encryption:
-"I was editing my password database at 2 AM, made a typo during the re-encryption, and now my 10 years of passwords are locked away forever because I can't figure out what I mistyped."
+"I was editing my password database at 2 AM, made a typo during the re-encryption,
+and now my 10 years of passwords are locked away forever because I can't figure out
+what I mistyped."
 
 2. ULTIMATE BACKUP FLEXIBILITY
-Passi's single-ASCII-file design means you can backup your entire password storage file using any method imaginable. Print the encrypted file directly (cat vault.asc | lpr) for fireproof storage in a safe, or print the decrypted contents (gpg -d vault.asc | lpr) for emergency access without computers. Email the encrypted file to yourself, paste it into secure notes in your favorite messenger, or simply copy-paste the text content anywhere you trust. Unlike directory-based password managers that require special backup procedures, passi works with every communication method humans have invented.
+Passi's single-ASCII-file design means you can backup your entire password storage file
+using any method imaginable. Print the encrypted file directly (cat vault.asc | lpr)
+for fireproof storage in a safe, or print the decrypted contents (gpg -d vault.asc | lpr)
+for emergency access without computers. Email the encrypted file to yourself, paste it
+into secure notes in your favorite messenger, or simply copy-paste the text content anywhere
+you trust. Unlike directory-based password managers that require special backup procedures,
+passi works with every communication method humans have invented.
 
 3. MULTIPLE PASSWORD STORAGE FILES
-Passi makes it trivial to maintain separate encrypted password storage files for different contexts using the `file` command. Keep personal passwords in `personal.asc`, work credentials in `work.asc`, and client access in `clients.asc` - each with their own master password, switched instantly with `passi file work.asc show`.
+Passi makes it trivial to maintain separate encrypted password storage files for different
+contexts using the `file` command. Keep personal passwords in `personal.asc`, work credentials
+in `work.asc`, and client access in `clients.asc` - each with their own master password,
+switched instantly with `passi file work.asc show`.
 
 4. SIMPLE YET POWERFUL SECURITY MODEL
-Passi uses straightforward "one master password" symmetric AES encryption, avoiding complex key management while being more quantum-resistant than RSA/ECC systems. At ~800 lines of readable bash code, it's simple enough to audit yet strong enough to hide everything in a single encrypted blob without revealing any metadata.
+Passi uses straightforward "one master password" symmetric AES encryption, avoiding complex
+key management while being more quantum-resistant than RSA/ECC systems. At ~800 lines
+of readable bash code, it's simple enough to audit yet strong enough to hide everything
+in a single encrypted blob without revealing any metadata.
 
 5. MODERN INTERFACE
-Passi provides a sleek interactive experience with fzf-powered selection menus instead of clunky tab completion, letting you visually browse and search your passwords. Smart field extraction means you can copy passwords, usernames, or 2FA codes to clipboard with simple commands like passi clip, passi clipu, or passi clipt. The flexible data structure lets you introduce any fields you need - from recovery emails to security questions - structuring your private data exactly how you want it.
+Passi provides a sleek interactive experience with fzf-powered selection menus instead
+of clunky tab completion, letting you visually browse and search your passwords.
+Smart field extraction means you can copy passwords, usernames, or 2FA codes to clipboard
+with simple commands like passi clip, passi clipu, or passi clipt. The flexible data
+structure lets you introduce any fields you need - from recovery emails to security
+questions - structuring your private data exactly how you want it.
 
 ```
