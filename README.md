@@ -25,7 +25,7 @@ SYNOPSIS
     passi [file <path>] <command> [args]
 
 FILE SELECTION:
-    passi <command>               Use default /home/r/.passi/passistore.asc
+    passi <command>               Use default /home/<your_username>/.passi/passistore.asc
     passi file <path> <command>   Use specific file
 
 COMMANDS:
@@ -100,7 +100,7 @@ COMMANDS:
         Show this detailed help.
 
 ENVIRONMENT VARIABLES:
-    PASSI_DIR              Password store directory (default: /home/r/.passi)
+    PASSI_DIR              Password store directory (default: /home/<your_username>/.passi)
     PASSI_CLIP_TIME        Clipboard timeout (default: 45 seconds)
     X_SELECTION            X11 clipboard selection (default: clipboard)
     EDITOR                 Text editor for editing records
