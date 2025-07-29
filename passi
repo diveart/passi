@@ -1,0 +1,1130 @@
+#!/usr/bin/env bash
+
+## #######################################################################
+## CONFIGURATION
+GPG_CIPHER="AES256"
+GPG_ITERATIONS=65011712
+GPG_ENCRYPTION_PARAMS=(--symmetric --armor --cipher-algo "$GPG_CIPHER" --digest-algo SHA256 --s2k-count "$GPG_ITERATIONS")
+DEFAULT_PASSWORD_LENGTH=30
+PASSI_DIR="${PASSI_DIR:-$HOME/.passi}"
+DEFAULT_PASSWORD_DB_FILE="$PASSI_DIR/passistore.asc"
+DEFAULT_FIELD_PASSWORD="password"
+DEFAULT_FIELD_USERNAME="username"
+DEFAULT_FIELD_TOTP="totp_secret"
+EDITOR="${EDITOR:-nano}"
+X_SELECTION="${X_SELECTION:-clipboard}"
+CLIP_TIME="${PASSI_CLIP_TIME:-45}"
+BASE64="base64"
+## END OF CONFIGURATION
+## #######################################################################
+
+umask 077
+set -o pipefail
+PROGRAM="${0##*/}"
+export GPG_TTY="${GPG_TTY:-$(tty 2>/dev/null)}"
+# gpg-connect-agent UPDATESTARTUPTTY /bye >/dev/null 2>&1
+
+## #######################################################################
+## ORIGINAL CODE FROM PASS
+die() {
+	echo "$@" >&2
+	exit 1
+}
+tmpdir() {
+	[[ -n $SECURE_TMPDIR ]] && return
+	local warn=1
+	[[ $1 == "nowarn" ]] && warn=0
+	local template="$PROGRAM.XXXXXXXXXXXXX"
+	if [[ -d /dev/shm && -w /dev/shm && -x /dev/shm ]]; then
+		SECURE_TMPDIR="$(mktemp -d "/dev/shm/$template")"
+		remove_tmpfile() {
+			rm -rf "$SECURE_TMPDIR"
+		}
+		trap remove_tmpfile EXIT
+	else
+		[[ $warn -eq 1 ]] && yesno "$(cat <<-_EOF
+		Your system does not have /dev/shm, which means that it may
+		be difficult to entirely erase the temporary non-encrypted
+		password file after editing.
+
+		Are you sure you would like to continue?
+		_EOF
+		)"
+		SECURE_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/$template")"
+		shred_tmpfile() {
+			find "$SECURE_TMPDIR" -type f -exec $SHRED {} +
+			rm -rf "$SECURE_TMPDIR"
+		}
+		trap shred_tmpfile EXIT
+	fi
+
+}
+SHRED="shred -f -z"
+yesno() {
+	[[ -t 0 ]] || return 0
+	local response
+	read -r -p "$1 [y/N] " response
+	[[ $response == [yY] ]] || exit 1
+}
+
+clip() {
+	if [[ -n $WAYLAND_DISPLAY ]]; then
+		local copy_cmd=( wl-copy )
+		local paste_cmd=( wl-paste -n )
+		if [[ $X_SELECTION == primary ]]; then
+			copy_cmd+=( --primary )
+			paste_cmd+=( --primary )
+		fi
+		local display_name="$WAYLAND_DISPLAY"
+	elif [[ -n $DISPLAY ]]; then
+		local copy_cmd=( xclip -selection "$X_SELECTION" )
+		local paste_cmd=( xclip -o -selection "$X_SELECTION" )
+		local display_name="$DISPLAY"
+	else
+		die "Error: No X11 or Wayland display detected"
+	fi
+	local sleep_argv0="password store sleep on display $display_name"
+
+	# This base64 business is because bash cannot store binary data in a shell
+	# variable. Specifically, it cannot store nulls nor (non-trivally) store
+	# trailing new lines.
+	pkill -f "^$sleep_argv0" 2>/dev/null && sleep 0.5
+	local before="$("${paste_cmd[@]}" 2>/dev/null | $BASE64)"
+	echo -n "$1" | "${copy_cmd[@]}" || die "Error: Could not copy data to the clipboard"
+	(
+		( exec -a "$sleep_argv0" bash <<<"trap 'kill %1' TERM; sleep '$CLIP_TIME' & wait" )
+		local now="$("${paste_cmd[@]}" | $BASE64)"
+		[[ $now != $(echo -n "$1" | $BASE64) ]] && before="$now"
+
+		# It might be nice to programatically check to see if klipper exists,
+		# as well as checking for other common clipboard managers. But for now,
+		# this works fine -- if qdbus isn't there or if klipper isn't running,
+		# this essentially becomes a no-op.
+		#
+		# Clipboard managers frequently write their history out in plaintext,
+		# so we axe it here:
+		qdbus org.kde.klipper /klipper org.kde.klipper.klipper.clearClipboardHistory &>/dev/null
+
+		echo "$before" | $BASE64 -d | "${copy_cmd[@]}"
+	) >/dev/null 2>&1 & disown
+	echo "Copied $2 to clipboard. Will clear in $CLIP_TIME seconds."
+}
+## END OF ORIGINAL CODE FROM PASS
+## #######################################################################
+
+
+## #######################################################################
+## CUSTOM PASSI CODE
+
+## ##################################
+## BASIC
+ensure_passi_dir() {
+    [[ -d "$PASSI_DIR" ]] || mkdir -p "$PASSI_DIR"
+}
+
+read_arg_or_stdin() {
+    local arg="$1"
+    if [[ "$arg" == "-" ]]; then
+        # Read entire line including spaces
+        IFS= read -r arg
+    fi
+    echo "$arg"
+}
+
+get_master_password_single() {
+    # local cache_id="X"  # Never cache, always ask for a password
+    local cache_id="passi_$(echo "$PASSWORD_DB_FILE" | sha256sum | cut -c1-12)"
+
+    # Get password through gpg-agent
+    local encoded=$(printf '%s' "$PASSWORD_DB_FILE" | sed 's/ /%20/g')
+    local password=$(printf 'GET_PASSPHRASE --data %s X Password: Enter%%20master%%20password%%20for%%20%s\nBYE\n' "$cache_id" "$encoded" | gpg-connect-agent --quiet 2>/dev/null | awk '/^D / {print substr($0,3)}')
+    
+    if [ -n "$password" ]; then
+        echo "$password"
+    else
+        # Fallback to original method if gpg-agent fails
+        echo -n "Master password: " >&2; read -rs password; echo >&2; echo "$password"
+    fi
+}
+
+check_master_password() {
+    echo "$1" | GPG_AGENT_INFO= gpg --batch --yes --passphrase-fd 0 --decrypt "$PASSWORD_DB_FILE" >/dev/null 2>&1
+}
+
+get_master_password() {
+    local master_password=$(get_master_password_single)
+    while ! check_master_password "$master_password"; do
+        local cache_id="passi_$(echo "$PASSWORD_DB_FILE" | sha256sum | cut -c1-12)"
+        gpg-connect-agent "CLEAR_PASSPHRASE $cache_id" /bye >/dev/null
+        master_password=$(get_master_password_single)
+    done
+    echo "$master_password"
+}
+
+check_dependencies() {
+    local required_commands=(openssl gpg awk fzf mkdir basename dirname cut sha256sum)
+    local missing=()
+    for cmd in "${required_commands[@]}"; do
+        if ! command -v "$cmd" &> /dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    if [ ${#missing[@]} -eq 0 ]; then
+        # echo "✅ All required tools are installed."
+        return 0
+    else
+        echo "❌ The following required tools are missing:"
+        for cmd in "${missing[@]}"; do
+            echo "  - $cmd"
+        done
+        return 1
+    fi
+}
+
+cmd_init() {
+    check_dependencies || die "Please consider installing the missing tools."
+    [[ -f "$PASSWORD_DB_FILE" ]] && die "File already exists: $PASSWORD_DB_FILE"
+
+    echo "Creating new password storage file..." >&2
+    
+    # Create template password storage file content with random data
+    local template_content="password_id: demo records/example_$(openssl rand -hex 2)
+username: user_$(openssl rand -hex 3)
+password: $(openssl rand -base64 12 | tr -d "=+/" | cut -c1-12)
+totp_secret: JBSWY3DPEHPK3PXP
+url: https://example.com
+notes: This is a demo entry with random data. Delete or modify as needed.
+
+password_id: demo records/demo_$(openssl rand -hex 2)
+username: user_$(openssl rand -hex 3)
+password: $(openssl rand -base64 12 | tr -d "=+/" | cut -c1-12)
+totp_secret: JBSWY3DPEHPK3PXP
+url: https://demo-site.com
+notes: Another demo entry. Customize your password storage file structure as needed.
++ Example of a multiline entry.
+"
+
+    # Encrypt and save the template - GPG will prompt for password
+    echo "GPG will prompt for your new master password..." >&2
+    local attempts=0
+    while ! echo "$template_content" | gpg "${GPG_ENCRYPTION_PARAMS[@]}" -o "$PASSWORD_DB_FILE"; do
+        ((attempts++))
+        [[ $attempts -ge 3 ]] && die "Encryption failed after 3 attempts"
+        yesno "GPG encryption failed. Would you like to try again?"
+    done
+    
+    echo "Password storage file created successfully: $PASSWORD_DB_FILE" >&2
+    echo "Demo records with random data added. Use 'open' to customize or 'edit' to modify individual records." >&2
+}
+
+cmd_edit_all() {
+    [[ -f "$PASSWORD_DB_FILE" ]] || die "Password file $PASSWORD_DB_FILE not found"
+    
+	tmpdir #Defines $SECURE_TMPDIR
+    local tmpfile="$(mktemp "$SECURE_TMPDIR/XXXXXX").rec"
+
+    local master_password=$(get_master_password)
+
+    if ! echo "$master_password" | gpg --quiet --batch --yes --passphrase-fd 0 --decrypt "$PASSWORD_DB_FILE" | tee "$tmpfile" > "$tmpfile.orig" 2>/dev/null; then
+        master_password=""; unset master_password
+        die "Failed to decrypt $PASSWORD_DB_FILE"
+    else
+        master_password=""; unset master_password
+    fi
+
+    
+	$EDITOR "$tmpfile"
+
+
+    if diff -q "$tmpfile" "$tmpfile.orig" >/dev/null 2>&1; then
+        echo "No changes detected"
+    else
+
+        local master_password=$(get_master_password)
+
+        local attempts=0
+    	while ! echo "$master_password" | gpg "${GPG_ENCRYPTION_PARAMS[@]}" --batch --passphrase-fd 0 -o "$tmpfile.gpg" "$tmpfile"; do
+            ((attempts++))
+            [[ $attempts -ge 3 ]] && die "Encryption failed after 3 attempts"
+    		yesno "GPG encryption failed. Would you like to try again?"
+    	done
+        master_password=""; unset master_password
+
+    local bak="$PASSWORD_DB_FILE.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$PASSWORD_DB_FILE" "$bak"
+    if mv "$tmpfile.gpg" "$PASSWORD_DB_FILE"; then
+        echo "Password storage file updated"
+        rm "$bak"
+        git_commit_if_enabled "Edit password storage file"
+    else
+        die "Failed to update password storage file. Backup preserved: $bak"
+    fi
+
+    fi
+
+
+}
+
+cmd_show_all() {
+    [[ -f "$PASSWORD_DB_FILE" ]] || die "Password file $PASSWORD_DB_FILE not found"
+    
+    local master_password=$(get_master_password)
+
+    echo "$master_password" | gpg --quiet --batch --yes --passphrase-fd 0 --decrypt "$PASSWORD_DB_FILE" 2>/dev/null
+    
+    master_password=""; unset master_password
+}
+
+get_record_by_id() {
+    local master_password="$1"
+    local target_id="$2"
+    
+    echo "$master_password" | gpg --quiet --batch --yes --passphrase-fd 0 --decrypt "$PASSWORD_DB_FILE" 2>/dev/null | \
+    awk -v target="$target_id" -v RS="" '
+    {
+        split($0, lines, "\n")
+        for (i=1; i<=length(lines); i++) {
+            if (lines[i] ~ /^password_id:/) {
+                # Extract password_id using same logic as get_value
+                value = substr(lines[i], 13)  # Remove "password_id:"
+                if (substr(value, 1, 1) == " ") {
+                    value = substr(value, 2)  # Remove exactly one space
+                }
+                if (value == target) {
+                    print
+                    exit
+                }
+                break  # Only one password_id per record expected
+            }
+        }
+    }'
+}
+
+get_record_safe() {
+    local password_id=$(read_arg_or_stdin "$1")
+    [[ -z $password_id ]] && { echo "password_id should not be empty" >&2; return 1; }
+    local master_password=$(get_master_password)
+    local record=$(get_record_by_id "$master_password" "$password_id")
+    master_password=""; unset master_password
+    [[ -z "$record" ]] && { echo "No record found" >&2; return 1; }
+    echo "$record"
+}
+
+get_value() {
+    local record="$1"
+    local field_name="$2"
+    
+    # Use awk to parse the rec format
+    echo "$record" | awk -v field="$field_name" '
+    BEGIN { 
+        found = 0
+        collecting = 0
+        result = ""
+    }
+    
+    # Check if this line starts a new field
+    /^[^+]/ && /:/ {
+        # If we were collecting a multiline field, stop
+        if (collecting) {
+            collecting = 0
+        }
+        
+        # Split on first colon
+        colon_pos = index($0, ":")
+        if (colon_pos > 0) {
+            current_field = substr($0, 1, colon_pos - 1)
+            value_part = substr($0, colon_pos + 1)
+            
+            if (current_field == field) {
+                found = 1
+                collecting = 1
+                # Skip exactly one space if it exists after the colon
+                if (substr(value_part, 1, 1) == " ") {
+                    result = substr(value_part, 2)
+                } else {
+                    result = value_part
+                }
+            }
+        }
+    }
+    
+    # Handle continuation lines (starting with +)
+    /^\+/ && collecting {
+        # Remove the + and optionally skip one space
+        line_content = substr($0, 2)
+        if (substr(line_content, 1, 1) == " ") {
+            line_content = substr(line_content, 2)
+        }
+        
+        if (result == "") {
+            result = line_content
+        } else {
+            result = result "\n" line_content
+        }
+    }
+    
+    # If we hit a new field while collecting, stop
+    /^[^+]/ && /:/ && collecting && substr($0, 1, index($0, ":") - 1) != field {
+        collecting = 0
+    }
+    
+    END {
+        if (found) {
+            print result
+        }
+    }
+    '
+}
+
+cmd_show() {
+    local record
+    record=$(get_record_safe "$1") || die "Failed to get record"
+    echo "$record"
+}
+
+cmd_edit() {
+    [[ -f "$PASSWORD_DB_FILE" ]] || die "Password file $PASSWORD_DB_FILE not found"
+
+    tmpdir
+    local tmpfile="$(mktemp "$SECURE_TMPDIR/XXXXXX").rec"
+    local tmpfile_full="$(mktemp "$SECURE_TMPDIR/XXXXXX").full"
+
+    local original_record
+    original_record=$(get_record_safe "$1") || die "Failed to get record"
+    
+    # Write original record to temp file for editing
+    echo "$original_record" > "$tmpfile"
+    echo "$original_record" > "$tmpfile.orig"  # Keep original for comparison
+    
+    # Edit the record
+    $EDITOR "$tmpfile"
+    
+    # Check if changes were made
+    if diff -q "$tmpfile" "$tmpfile.orig" >/dev/null 2>&1; then
+        echo "No changes detected"
+        return 0
+    fi
+    
+    echo "Changes detected. Updating password storage file..." >&2
+    
+    local master_password=$(get_master_password)
+
+    # Read the edited record
+    local new_record
+    new_record=$(cat "$tmpfile")
+    
+    # Use AWK pattern to find and replace the exact record block
+    echo "$master_password" | gpg --quiet --batch --yes --passphrase-fd 0 --decrypt "$PASSWORD_DB_FILE" 2>/dev/null | \
+    awk -v target="$original_record" -v replacement="$new_record" '
+    BEGIN { buf=""; in_block=0; }
+    
+    # Empty line indicates end of record block
+    /^$/ && in_block {
+        if (buf == target) {
+            print replacement
+        } else {
+            print buf
+        }
+        print ""  # Print the empty line separator
+        buf=""; in_block=0; 
+        next
+    }
+    
+    # Non-empty line - accumulate current block
+    /^./ {
+        if (in_block) {
+            buf = buf "\n" $0
+        } else {
+            buf = $0
+            in_block = 1
+        }
+        next
+    }
+    
+    # Empty line when not in block - just print it
+    !in_block { print }
+    
+    END {
+        # Handle last block if file doesn'\''t end with empty line
+        if (in_block) {
+            if (buf == target) {
+                print replacement
+            } else {
+                print buf
+            }
+        }
+    }
+    ' > "$tmpfile_full"
+
+    
+    # Encrypt the updated password storage file
+    local attempts=0
+    while ! echo "$master_password" | gpg "${GPG_ENCRYPTION_PARAMS[@]}" --batch --passphrase-fd 0 -o "$tmpfile_full.gpg" "$tmpfile_full"; do
+        ((attempts++))
+        [[ $attempts -ge 3 ]] && die "Encryption failed after 3 attempts"
+        yesno "GPG encryption failed. Would you like to try again?"
+    done
+    
+    # Clear encryption password
+    master_password=""; unset master_password
+    
+    # Create backup and update the password storage file
+    local bak="$PASSWORD_DB_FILE.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$PASSWORD_DB_FILE" "$bak"
+    if mv "$tmpfile_full.gpg" "$PASSWORD_DB_FILE"; then
+        echo "Password storage file updated successfully"
+        rm "$bak"
+        git_commit_if_enabled "Edit password entry"
+    else
+        die "Failed to update password storage file. Backup preserved: $bak"
+    fi
+}
+
+cmd_clip() {
+    local record
+    record=$(get_record_safe "$1") || die "Failed to get record"
+    local password_value=$(get_value "$record" "$DEFAULT_FIELD_PASSWORD")
+    [[ -z "$password_value" ]] && die "No password found"
+    clip "$password_value" "password"
+}
+
+cmd_clipu() {
+    local record
+    record=$(get_record_safe "$1") || die "Failed to get record"
+    local username_value=$(get_value "$record" "$DEFAULT_FIELD_USERNAME")
+    [[ -z "$username_value" ]] && die "No username found"
+    clip "$username_value" "username"
+}
+
+cmd_totp() {
+    local record
+    record=$(get_record_safe "$1") || die "Failed to get record"
+    local totp_secret=$(get_value "$record" "$DEFAULT_FIELD_TOTP")
+    [[ -z "$totp_secret" ]] && die "No TOTP secret found"
+    oathtool --base32 --totp "$totp_secret"
+}
+
+cmd_clipt() {
+    local record
+    record=$(get_record_safe "$1") || die "Failed to get record"
+    local totp_secret=$(get_value "$record" "$DEFAULT_FIELD_TOTP")
+    [[ -z "$totp_secret" ]] && die "No TOTP secret found"
+    local totp_code=$(oathtool --base32 --totp "$totp_secret")
+    clip "$totp_code" "TOTP code"
+}
+
+cmd_add() {
+    [[ -f "$PASSWORD_DB_FILE" ]] || die "Password file $PASSWORD_DB_FILE not found"
+
+    tmpdir
+    local tmpfile="$(mktemp "$SECURE_TMPDIR/XXXXXX").rec"
+    local tmpfile_full="$(mktemp "$SECURE_TMPDIR/XXXXXX").full"
+
+    # Create template for new entry
+    local generated_password=$(generate_password)
+    local template="password_id: 
+username: 
+password: $generated_password
+url: 
+notes: "
+
+    echo "$template" > "$tmpfile"
+    echo "$template" > "$tmpfile.orig"
+    
+    # Edit the new record
+    $EDITOR "$tmpfile"
+    
+    # Check if changes were made
+    if diff -q "$tmpfile" "$tmpfile.orig" >/dev/null 2>&1; then
+        echo "No changes detected - entry not added"
+        return 0
+    fi
+    
+    local new_record
+    new_record=$(cat "$tmpfile")
+    
+    echo "Adding new entry..." >&2
+    
+    local master_password=$(get_master_password)
+    
+    
+    # Get current password storage file content and prepend new record
+    echo "$master_password" | gpg --quiet --batch --yes --passphrase-fd 0 --decrypt "$PASSWORD_DB_FILE" 2>/dev/null > "$tmpfile_full"
+    
+    # Create new password storage file with new record at the beginning
+    {
+        echo "$new_record"
+        echo ""
+        cat "$tmpfile_full"
+    } > "$tmpfile_full.new"
+    
+    # Encrypt the updated password storage file
+    local attempts=0
+    while ! echo "$master_password" | gpg "${GPG_ENCRYPTION_PARAMS[@]}" --batch --passphrase-fd 0 -o "$tmpfile_full.new.gpg" "$tmpfile_full.new"; do
+        ((attempts++))
+        [[ $attempts -ge 3 ]] && die "Encryption failed after 3 attempts"
+        yesno "GPG encryption failed. Would you like to try again?"
+    done
+    
+    master_password=""; unset master_password
+    
+    # Create backup and update the password storage file
+    local bak="$PASSWORD_DB_FILE.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$PASSWORD_DB_FILE" "$bak"
+    if mv "$tmpfile_full.new.gpg" "$PASSWORD_DB_FILE"; then
+        echo "Entry added successfully"
+        rm "$bak"
+        git_commit_if_enabled "Add new password entry"
+    else
+        die "Failed to update password storage file. Backup preserved: $bak"
+    fi
+}
+
+get_all_password_ids() {
+    local master_password="$1"
+    
+    echo "$master_password" | gpg --quiet --batch --yes --passphrase-fd 0 --decrypt "$PASSWORD_DB_FILE" 2>/dev/null | \
+    awk '
+    BEGIN { RS=""; FS="\n" }
+    /password_id:/ {
+        for (i=1; i<=NF; i++) {
+            if ($i ~ /^password_id:/) {
+                # Remove "password_id:" and exactly one space if present
+                value = substr($i, 13)  # Remove "password_id:"
+                if (substr(value, 1, 1) == " ") {
+                    value = substr(value, 2)  # Remove exactly one space
+                }
+                if (value != "") print value
+            }
+        }
+    }'
+}
+
+cmd_list() {
+    local master_password=$(get_master_password)
+    get_all_password_ids $master_password
+    master_password=""; unset master_password
+}
+
+## ##################################
+## PASSWORD GENERATION
+generate_password() {
+    local length="${1:-$DEFAULT_PASSWORD_LENGTH}"
+    openssl rand -base64 $((length * 2)) | tr -d "=+/\n " | head -c $length
+}
+
+cmd_generate_password() { generate_password $1; echo; }
+
+## ##################################
+## QR PROCESSING
+cmd_qr() {
+   local image_file="$1"
+   
+   [ -f "$image_file" ] || die "Image file not found: $image_file"
+   
+   local qr_data
+   qr_data=$(zbarimg --quiet --raw "$image_file" 2>/dev/null)
+   [ -n "$qr_data" ] || die "No QR code found in image"
+   
+   local totp_secret
+   totp_secret=$(printf '%s\n' "$qr_data" | sed -n 's/.*secret=\([^&]*\).*/\1/p')
+   
+   if [ -n "$totp_secret" ]; then
+       printf 'Copy these lines to your password record:\n'
+       printf 'totp_secret: %s\n' "$totp_secret"
+       printf 'totp_secret_details: %s\n' "$qr_data"
+   else
+       printf 'QR code data: %s\n' "$qr_data"
+       printf 'Not a standard TOTP QR code format\n'
+   fi
+}
+
+## ##################################
+## GIT
+cmd_git() {
+    local git_dir="$(dirname "$PASSWORD_DB_FILE")"
+    
+    # Check if git repo exists
+    if ! git -C "$git_dir" rev-parse --git-dir >/dev/null 2>&1; then
+        if [[ "$1" == "init" ]]; then
+            git -C "$git_dir" init
+            git branch -m main
+            echo "*.asc diff=gpg" > "$git_dir/.gitattributes"
+            git -C "$git_dir" add .gitattributes
+            git -C "$git_dir" config --local diff.gpg.binary true
+            git -C "$git_dir" config --local diff.gpg.textconv "gpg -d --quiet --batch --yes"
+            if [[ -f "$PASSWORD_DB_FILE" ]]; then
+                local db_filename="$(basename "$PASSWORD_DB_FILE")"
+                git -C "$git_dir" add "$db_filename"
+            fi
+            git -C "$git_dir" commit -m "Initialize password store git repository"
+            return
+        else
+            die "Error: Not a git repository. Run 'passi git init' first."
+        fi
+    fi
+    
+    # Execute git command in password store directory
+    git -C "$git_dir" "$@"
+}
+
+git_commit_if_enabled() {
+    local message="$1"
+    local git_dir="$(dirname "$PASSWORD_DB_FILE")"
+    
+    # Only commit if git repo exists
+    if git -C "$git_dir" rev-parse --git-dir >/dev/null 2>&1; then
+        local db_filename="$(basename "$PASSWORD_DB_FILE")"
+        git -C "$git_dir" add "$db_filename"
+        if ! git -C "$git_dir" commit -m "$message" >/dev/null 2>&1; then
+            echo "Warning: Git commit failed. Password storage file updated but not committed." >&2
+        fi
+    fi
+}
+
+## ##################################
+## INTERACTIVE
+select_password_id() {
+    local master_password="$1"
+    local prompt="${2:-Select record: }"
+    
+    local password_ids
+    password_ids=$(get_all_password_ids "$master_password")
+    
+    if [[ -z "$password_ids" ]]; then
+        die "No password records found in password storage file"
+    fi
+    
+    local selected_id
+    selected_id=$(echo "$password_ids" | fzf --prompt="$prompt" \
+                                            --height=40% \
+                                            --border \
+                                            --preview-window=hidden \
+                                            --header="Use arrows/search to select, Enter to confirm, Esc to cancel")
+    local fzf_exit_code=$?
+    
+    password_ids=""  # cleanup
+    
+    case $fzf_exit_code in
+        0) echo "$selected_id" ;;           # Normal selection
+        1) echo "Selection cancelled" >&2; return 1 ;;  # Esc key
+        130) echo "Interrupted" >&2; exit 130 ;;        # Ctrl+C - propagate signal
+        *) echo "Selection failed" >&2; return 1 ;;     # Other errors
+    esac
+}
+
+cmd_interactive() {
+    [[ -f "$PASSWORD_DB_FILE" ]] || die "Password file $PASSWORD_DB_FILE not found"
+    command -v fzf >/dev/null 2>&1 || die "fzf is required but not installed"
+    echo "Entering interactive mode..."
+    local selected_id
+    local master_password=$(get_master_password)
+    selected_id=$(select_password_id "$master_password" "Select record: ")
+    master_password=""; unset master_password
+    if [[ -z $selected_id ]]; then
+        return 1
+    fi
+    echo "Selected: $selected_id"
+    
+    while true; do
+        local action
+        action=$(echo -e "clip username\nclip password\nclip totp\nshow totp\nshow\nedit" | fzf \
+            --prompt="Choose action for the \"$selected_id\" record: " \
+            --height=40% \
+            --border \
+            --header="Use arrows/search to select, Enter to confirm, Esc to cancel")
+        local fzf_exit_code=$?
+        case $fzf_exit_code in
+            1|130) echo "Exiting interactive mode"; break ;; # Esc or Ctrl+C
+            0) case "$action" in # Normal selection
+                    "show") echo ---; cmd_show "$selected_id"; echo --- ;;
+                    "clip password") cmd_clip "$selected_id" ;;
+                    "clip username") cmd_clipu "$selected_id" ;;
+                    "clip totp") cmd_clipt "$selected_id" ;;
+                    "show totp") cmd_totp "$selected_id" ;;
+                    "edit") cmd_edit "$selected_id" ;;
+                    *) echo "Unknown action: $action" ;;
+               esac
+               ;;
+            *) echo "Selection failed"; break ;;
+        esac
+        echo "Press Enter to continue, Esc to exit..."
+        read -rsn1 key
+        [[ $key == $'\e' ]] && break
+    done
+}
+
+## ##################################
+## HELP
+cmd_version() {
+	cat <<-_EOF
+
+       .=++-                                         "   
+      *%+-=*%:         mmmm    mmm    mmm    mmm   mmm   
+     +@     +@         #" "#  "   #  #   "  #   "    #   
+     *%     -@.        #   #  m"""#   """m   """m    #   
+    *%#*****#%%:       ##m#"  "mm"#  "mmm"  "mmm"  mm#mm 
+    @=        @+       #         (PASS-Inspired)                        
+    @=   @=   @=       "               v0.1           
+    @-   -    @+   
+    @#+++==+++@=   
+    .---------:    
+_EOF
+}
+
+cmd_help() {
+    cmd_version
+    echo
+    cat <<-_EOF
+
+	Passi is a simple secure password manager inspired by pass and covering
+	all major aspects of modern credential handling. Main conveniences:
+	    - single encrypted ASCII file,
+	    - typo-proof symmetric encryption,
+	    - human-readable structured record format allowing to easily get needed values,
+	    - 2FA workflow support,
+	    - CLI-friendly and interactive user experiences.
+
+
+	Usage: $PROGRAM [file <path>] <command> [args]
+	
+	Examples:
+	    $PROGRAM man                     # Full manual
+	    $PROGRAM init                    # Create $PASSWORD_DB_FILE
+	    $PROGRAM add                     # Add new record
+	    $PROGRAM i                       # Interactive mode
+	    $PROGRAM show gmail              # Show gmail record
+	    $PROGRAM clipu work/crm          # Copy username to clipboard
+	    $PROGRAM qr screenshot.png       # Extract TOTP from QR code
+	    $PROGRAM 2fa gmail               # Show TOTP code for gmail
+	    $PROGRAM c2fa gmail              # Copy TOTP code for gmail to clipboard
+	    $PROGRAM edit work/wifi          # Edit specific record
+	    $PROGRAM genp 30                 # Generate 30-char password
+	    $PROGRAM git log                 # View change history
+	    $PROGRAM l | dmenu | $PROGRAM c -   # List and copy password
+
+	CURRENT CONFIGURATION:
+	    Password storage file:   $PASSWORD_DB_FILE
+	    GPG Cipher:              $GPG_CIPHER
+	    GPG Iterations:          $GPG_ITERATIONS
+	
+	Configuration can be modified by editing: $(realpath "$0")
+	_EOF
+}
+
+cmd_man() {
+    cat <<_EOF | less -
+NAME
+    $PROGRAM is a simple yet powerful and convenient password manager.
+
+COMPLETE MODERN PASSWORD MANAGEMENT LIFECYCLE
+Passi provides a full-featured password management workflow covering every aspect of modern credential handling. Generate secure passwords with passi genp, store them with structured metadata using passi add, and retrieve credentials instantly via passi show or passi clip, or browse interactively with passi i. For two-factor authentication, scan QR codes from authenticator setup screens with passi qr screenshot.png to extract TOTP secrets, then generate time-based one-time passwords on demand with passi totp. From initial password creation to daily authentication workflows, passi handles the complete security lifecycle without requiring multiple tools or complex integrations.
+
+SYNOPSIS
+    $PROGRAM [file <path>] <command> [args]
+
+FILE SELECTION:
+    $PROGRAM <command>               Use default $DEFAULT_PASSWORD_DB_FILE
+    $PROGRAM file <path> <command>   Use specific file
+
+COMMANDS:
+    init
+        Initialize new password storage file with demo records.
+
+    interactive
+        Interactive mode. Browse password entries and perform actions.
+        Aliases: i
+
+    list
+        List all password IDs in the password storage file.
+        Aliases: ls, l
+
+    show <password_id>
+        Show password record for the specified password_id.
+        
+    show all
+        Show entire decrypted password storage file.
+        
+    clip <password_id>
+        Copy password to clipboard for the specified password_id. Clears after $CLIP_TIME seconds.
+        Aliases: c, clipp, cp
+        
+    clipu <password_id>
+        Copy username to clipboard for the specified password_id. Clears after $CLIP_TIME seconds.
+        Aliases: cu
+        
+    add
+        Add new password entry using editor with pre-generated password.
+        Aliases: a, new, n
+        
+    edit <password_id>
+        Edit existing password entry with the specified password_id.
+        Aliases: e
+        
+    edit all
+        Edit entire password storage file in editor.
+        
+    open
+        Alias for 'edit all' - edit entire password storage file.
+        Aliases: o
+        
+    clipt <password_id>
+        Copy TOTP code to clipboard for the specified password_id. Clears after $CLIP_TIME seconds.
+        Aliases: ct, c2fa
+        
+    totp <password_id>
+        Show TOTP authentication code for the specified password_id.
+        Aliases: t, authenticate, 2fa
+
+    qr <image_file>
+        Extract TOTP secret from QR code image for 2FA setup.
+        Outputs totp_secret and totp_secret_details lines to copy into records.
+            Aliases: scan, authqr, qr2fa, totpqr, 2faqr
+
+    genp [length]
+        Generate secure password. Default length: $DEFAULT_PASSWORD_LENGTH characters.
+        Aliases: generate, gp, g
+        
+    git <git_command>
+        Execute git commands in password store directory.
+        Use '$PROGRAM git init' to initialize git repository.
+        
+    version
+        Show version information.
+        
+    help
+        Show short help with examples.
+        
+    man
+        Show this detailed help.
+
+ENVIRONMENT VARIABLES:
+    PASSI_DIR              Password store directory (default: $HOME/.passi)
+    PASSI_CLIP_TIME        Clipboard timeout (default: 45 seconds)
+    X_SELECTION            X11 clipboard selection (default: clipboard)
+    EDITOR                 Text editor for editing records
+
+PASSWORD STORAGE FILE FORMAT:
+    Records use rec format with fields like password_id, username, password, url, notes.
+    Multiline fields use '+' continuation lines.
+    See https://www.gnu.org/software/recutils/ for more details.
+
+EXIT CODES:
+    0    Success
+    1    General error
+    130  Interrupted (Ctrl+C)
+
+DEPENDENCIES:
+    - gpg (encryption)
+    - fzf (interactive selection)
+    - xclip or wl-copy (clipboard)
+    - oathtool (TOTP codes)
+    - zbar-tools (QR code scanning)
+    - git (optional versioning)
+    - diff (for detecting changes during editing)
+
+SEE ALSO:
+    gpg(1), fzf(1), oathtool(1), zbarimg(1), recutils(7)
+
+COPYING
+This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation; either version 2 of the License, or (at your option) any later version.
+
+MAIN DIFFERENTIATION POINTS PASSI VS PASS
+- Single encrypted ASCII file, zero metadata leakage
+- Typo-proof symmetric encryption
+- Ability to structure records and easily get needed values
+- 2FA support: built-in QR scanning and TOTP generation
+- Easy switching of multiple password storage files
+
+REAL LIFE WORKFLOWS
+
+INITIAL SETUP
+passi init                         # Initialize your default password storage file
+passi open                         # Add passwords in bulk by editing the entire password storage file
+
+INTERACTIVE MODE
+passi i                            # Browse entries visually, then choose actions
+
+ADDING NEW PASSWORD RECORDS
+passi genp 30                      # Generate a secure 30-character password
+passi add                          # Add new record (pre-filled with generated password)
+passi qr ~/Downloads/setup-qr.png  # Extract TOTP secret from authenticator QR code
+passi edit gmail                   # Add the TOTP secret to your existing record
+
+DAILY USAGE
+passi clipu work/vpn               # Copy username for work VPN
+passi clip personal/gmail          # Copy password to clipboard for login
+passi totp work/gmail              # Show 2FA code for Gmail login
+passi clipt bank                   # Copy 2FA code to clipboard for banking
+
+BROWSING AND FINDING
+passi list                         # List all password IDs
+passi show work/wifi               # Show record for work Wi-Fi
+passi clip work/email              # Copy work email password to clipboard
+passi show all                     # Show all password storage file records
+
+MAINTENANCE AND UPDATES
+passi edit gmail                   # Edit specific record directly
+passi show gmail | grep url        # Find URL for specific service
+
+MANAGING MULTIPLE CONTEXTS
+passi file work.asc init           # Create separate work password storage file
+passi file work.asc add            # Add work-specific password
+passi file personal.asc clip gmail # Access personal Gmail from personal password storage file
+passi file clients.asc show        # Browse client access credentials
+
+EMERGENCY WORKFLOWS
+gpg -d ~/.passi/passistore.asc     # Direct GPG decryption w/o passi installed
+gpg -d vault.asc | grep -A5 gmail  # Find specific entry without passi
+
+ADVANCED WORKFLOWS
+# Extract specific data for scripts:
+passi show aws | grep username     # Get AWS username
+passi totp work/vpn > /tmp/code    # Save 2FA code for script use
+
+# Bulk operations:
+passi open                         # Edit multiple records at once
+passi show all | grep -A5 "work/"  # Find all work-related records
+
+# Integration with other tools:
+passi list | dmenu | passi clip -  # GUI password selection
+passi clip \$(passi list | fzf)     # Alternative interactive selection
+
+VERSION CONTROL
+passi git init                     # Enable version control for your password history
+passi git log                      # View change history
+passi git diff HEAD~1              # See what changed in last edit
+passi git branch backup            # Create backup branch before major changes
+
+TERMINOLOGY & CONCEPTS
+🔐 CORE CONCEPTS:
+- Password Storage File   Single encrypted file containing all your data
+- Master Password         Single password that encrypts your entire password storage file
+- Record                  A complete set of login, password, and any other related information
+- Password ID             Unique identifier for each record
+
+📝 DEFAULT RECORD FORMAT:
+- password_id             Record identifier
+- url                     Website or service URL
+- username                Login username
+- password                Login password
+- totp_secret             Base32 secret for 2FA/TOTP codes
+- totp_secret_details     Full otpauth:// URL from QR codes, includes totp_secret
+- notes                   Free-form notes
+
+🔧 TECHNICAL TERMS:
+- GPG                     GNU Privacy Guard - encryption software
+- AES256                  Advanced Encryption Standard with 256-bit key
+- TOTP                    Time-based One-Time Password (6-digit 2FA codes)
+- TOTP Secret             Secret key used to generate 6-digit codes
+- QR Code                 Square barcode containing TOTP setup information
+- QR Code URL             otpauth:// URL embedded in QR codes for 2FA setup
+- Rec Format              GNU standard for human readable, plain text databases
+
+💡 EXAMPLES:
+- Password IDs:           gmail personal, Work VPN, bank_main, github/dev
+- Complete Record:        password_id: work/gmail
+                          username: john.doe@example.com
+                          password: MyStr0ngP@ssw0rd!
+                          url: https://mail.google.com
+                          totp_secret: JBSWY3DPEHPK3PXP
+                          custom_field: custom contents
+                          2fa_email: personal_email@example.com
+                          notes: Work email account
+                          + Recovery phone: +1-555-0123
+
+🎯 DESIGN TRADE-OFFS
+Passi prioritizes:
+- Simple code over extensive functionality
+- But simple data format over simple code
+- Human-readable data over format performance optimization
+- Single file over complex directory structure
+- Metadata privacy over filesystem convenience
+- Symmetric encryption over asymmetric key sharing
+- Master password in your head over managing keys and certificates   
+
+NOTABLE ADVANTAGES
+
+1. TYPO-PROOF SYMMETRIC ENCRYPTION
+Passi prevents accidental password changes by validating your master password against the existing password storage file before allowing any modifications. When you enter the password for encryption, passi first tests that this same password can successfully decrypt your existing data - eliminating the risk of typos creating an inaccessible password storage file.
+So this is impossible with passi even though you use symmetric encryption:
+"I was editing my password database at 2 AM, made a typo during the re-encryption, and now my 10 years of passwords are locked away forever because I can't figure out what I mistyped."
+
+2. ULTIMATE BACKUP FLEXIBILITY
+Passi's single-ASCII-file design means you can backup your entire password storage file using any method imaginable. Print the encrypted file directly (cat vault.asc | lpr) for fireproof storage in a safe, or print the decrypted contents (gpg -d vault.asc | lpr) for emergency access without computers. Email the encrypted file to yourself, paste it into secure notes in your favorite messenger, or simply copy-paste the text content anywhere you trust. Unlike directory-based password managers that require special backup procedures, passi works with every communication method humans have invented.
+
+3. MULTIPLE PASSWORD STORAGE FILES
+Passi makes it trivial to maintain separate encrypted password storage files for different contexts using the \`file\` command. Keep personal passwords in \`personal.asc\`, work credentials in \`work.asc\`, and client access in \`clients.asc\` - each with their own master password, switched instantly with \`passi file work.asc show\`.
+
+4. SIMPLE YET POWERFUL SECURITY MODEL
+Passi uses straightforward "one master password" symmetric AES encryption, avoiding complex key management while being more quantum-resistant than RSA/ECC systems. At ~800 lines of readable bash code, it's simple enough to audit yet strong enough to hide everything in a single encrypted blob without revealing any metadata.
+
+5. MODERN INTERFACE
+Passi provides a sleek interactive experience with fzf-powered selection menus instead of clunky tab completion, letting you visually browse and search your passwords. Smart field extraction means you can copy passwords, usernames, or 2FA codes to clipboard with simple commands like passi clip, passi clipu, or passi clipt. The flexible data structure lets you introduce any fields you need - from recovery emails to security questions - structuring your private data exactly how you want it.
+
+_EOF
+}
+
+## #############################################
+
+
+
+
+cmd_dispatch() {
+    case "$1" in
+        init) shift; cmd_init "$@" ;;
+        i|interactive) shift; cmd_interactive "$@" ;;
+        list|ls|l) shift; cmd_list "$@" ;;
+        add|a|new|n) shift; cmd_add "$@" ;;
+        show|s) shift;
+            case "$1" in
+                all|a) shift; cmd_show_all "$@" ;;
+                *) cmd_show "$@" ;;
+            esac ;;
+        edit|e) shift;
+            case "$1" in
+                all|a) shift; cmd_edit_all "$@" ;;
+                *) cmd_edit "$@" ;;
+            esac ;;
+        open|o) shift; cmd_edit_all "$@" ;;
+        clip|c) shift;
+            case "$1" in
+                p|pass|password|pwd) shift; cmd_clip "$@" ;;
+                u|user|username) shift; cmd_clipu "$@" ;;
+                2|2fa|totp|t) shift; cmd_clipt "$@" ;;
+                *) cmd_clip "$@" ;;
+            esac ;;
+        clipp|cp) shift; cmd_clip "$@" ;;
+        clipu|cu) shift; cmd_clipu "$@" ;;
+        clipt|ct|c2fa) shift; cmd_clipt "$@" ;;
+        qr2fa|authqr|qr|scan|2faqr|totpqr) shift; cmd_qr "$@" ;;
+        totp|t|authenticate|2fa) shift; cmd_totp "$@" ;;
+        generate|genp|gp|g) shift; cmd_generate_password "$@" ;;
+        git) shift; cmd_git "$@" ;;
+        version|--version) shift; cmd_version "$@" ;;
+        help|--help) shift; cmd_help "$@" ;;
+        man|manual|--man|--manual) shift; cmd_man "$@" ;;
+        *) cmd_help "$@" ;;
+    esac
+}
+
+
+case "$1" in
+    f|file)
+        if [[ -z "$2" ]]; then
+            echo "Error: file command requires a path" >&2
+            exit 1
+        fi
+        PASSWORD_DB_FILE="$2"
+        shift 2
+        cmd_dispatch "$@" ;;
+    *)
+        ensure_passi_dir
+        PASSWORD_DB_FILE="$DEFAULT_PASSWORD_DB_FILE"
+        cmd_dispatch "$@" ;;
+esac
+
+
+
+exit 0
+
